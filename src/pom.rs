@@ -1,6 +1,5 @@
 use std::{
-    fmt::format,
-    fmt::{self, Debug},
+    fmt::{self, format},
     fs,
     process::Command,
 };
@@ -11,6 +10,7 @@ struct Artifact {
     group_id: Option<String>,
     artifact_id: String,
     version: Option<String>,
+    latest_version: Option<String>,
 }
 
 impl Artifact {
@@ -19,6 +19,7 @@ impl Artifact {
             group_id: None,
             artifact_id: String::from(artifact_id),
             version: None,
+            latest_version: None,
         }
     }
 }
@@ -26,84 +27,97 @@ impl Artifact {
 impl Clone for Artifact {
     fn clone(&self) -> Self {
         Artifact {
-            group_id: match &self.group_id {
-                Some(v) => Some(String::from(v)),
-                None => None,
-            },
+            group_id: self.group_id.as_ref().map(String::from),
             artifact_id: String::from(&self.artifact_id),
-            version: match &self.version {
-                Some(v) => Some(String::from(v)),
-                None => None,
-            },
+            version: self.version.as_ref().map(String::from),
+            latest_version: None,
         }
     }
 }
 
+#[allow(dead_code)]
 struct Module {
     artifact: Artifact,
     dependencies: Vec<Artifact>,
     source: String,
 }
 
-struct Pom {
+impl Clone for Module {
+    fn clone(&self) -> Self {
+        Module {
+            artifact: self.artifact.clone(),
+            dependencies: self.dependencies.clone(),
+            source: self.source.clone(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub struct Pom {
     root: Artifact,
     parent: Option<Artifact>,
     modules: Vec<Module>,
     dependencies: Vec<Artifact>,
     source: String,
+    skip_group: Option<String>,
 }
-
-pub fn test(root_dir: &str, skip_group: &str) {
-    let parse = Pom::from_file(&root_dir);
-    //println!("{:#?}", parse);
-    //let parent_1 = match fetch_parent_pom(&parse) {
-    //    Some(v) => Some(Pom::from_str(&v)),
-    //    None => None,
-    //};
-    //match parent_1 {
-    //    Some(ppom) => {
-    //        let parent_2 = match fetch_parent_pom(&ppom) {
-    //            Some(v) => Some(Pom::from_str(&v)),
-    //            None => None,
-    //        };
-    //        println!("{:#?}", parent_2);
-    //    }
-    //    None => todo!(),
-    //};
-
-    fetch_parents(&parse)
-        .iter()
-        .for_each(|p| println!("{:#?}", p));
-}
-
-fn fetch_parents(pom: &Pom) -> Vec<Pom> {
-    let mut parents = vec![];
-
-    let mut optional = match &pom.parent {
-        Some(v) => Some(v.clone()),
-        None => None,
-    };
-    todo!("Change fetch_parent_pom input parameter to 'i");
-    while let Some(ref i) = optional {
-        let parent = match fetch_parent_pom(optional.clone()) {
-            Some(v) => {
-                println!("{:?}", &optional);
-                let value = Pom::from_str(&v);
-                optional = match value.parent {
-                    Some(ref v) => Some(v.clone()),
-                    None => None,
-                };
-                parents.push(value);
-            }
-            None => return parents,
-        };
+impl Clone for Pom {
+    fn clone(&self) -> Self {
+        Pom {
+            root: self.root.clone(),
+            parent: self.parent.clone(),
+            modules: self.modules.clone(),
+            dependencies: self.dependencies.clone(),
+            source: self.source.clone(),
+            skip_group: self.skip_group.clone(),
+        }
     }
+}
 
-    parents
+fn get_version_from_parents(prop: &Artifact, parents: &[&Pom]) -> Option<String> {
+    let mut version: Option<String> = None;
+    for parent in parents.iter() {
+        let artifact_version = match &prop.version {
+            Some(v) => String::from(v),
+            None => String::new(),
+        };
+        let properties_version = get_property(&artifact_version, &parent.source);
+        match properties_version {
+            Some(v) => {
+                if !&v.starts_with("$") {
+                    version = Some(v);
+                    break;
+                }
+                let dependencies_version = get_version_from_parent_dependencies(prop, parent);
+                if dependencies_version.is_some() {
+                    version = dependencies_version;
+                    break;
+                }
+            }
+            None => {
+                let dependencies_version = get_version_from_parent_dependencies(prop, parent);
+                if dependencies_version.is_some() {
+                    version = dependencies_version;
+                    break;
+                }
+            }
+        }
+    }
+    version
+}
+
+fn get_version_from_parent_dependencies(prop: &Artifact, parent: &Pom) -> Option<String> {
+    let mut version: Option<String> = None;
+    for dep in parent.dependencies.clone() {
+        if dep.artifact_id.eq(&prop.artifact_id) {
+            version = dep.version;
+        }
+    }
+    version
 }
 
 impl Pom {
-    fn from_file(path: &str) -> Self {
+    pub fn from_file(path: &str, skip_group: &str) -> Self {
         let pom = fs::read_to_string(Self::get_root_pom_path(path)).expect("");
         let parent = Self::get_parent(&pom);
         let pom = remove_parent(&pom);
@@ -115,6 +129,7 @@ impl Pom {
             modules,
             dependencies: get_dependencies(&pom),
             source: pom.replace("\n", "").replace("\t", "").replace(" ", ""),
+            skip_group: Some(String::from(skip_group)),
         }
     }
 
@@ -132,6 +147,7 @@ impl Pom {
             modules,
             dependencies: get_dependencies(&pom),
             source: pom.replace("\n", "").replace("\t", "").replace(" ", ""),
+            skip_group: None,
         }
     }
 
@@ -141,7 +157,7 @@ impl Pom {
         match parent_pattern.captures(pom) {
             Some(v) => {
                 let parent = v.get(0).map_or("", |x| x.as_str());
-                let artifact = get_artifact(&parent);
+                let artifact = get_artifact(parent);
                 Some(artifact)
             }
             None => None,
@@ -194,6 +210,107 @@ impl Pom {
 
         modules
     }
+
+    pub fn fetch_parents(&self) -> Vec<Pom> {
+        let mut parents = vec![];
+
+        let mut optional = self.parent.clone();
+        while let Some(ref _i) = optional {
+            match fetch_parent_pom(optional.clone()) {
+                Some(v) => {
+                    let value = Pom::from_str(&v);
+                    optional = value.parent.clone();
+                    parents.push(value);
+                }
+                None => return parents,
+            };
+        }
+
+        parents
+    }
+
+    pub fn fetch_latest_versions(&mut self) {
+        println!("{:?}", self.root.artifact_id);
+        self.dependencies.iter_mut().for_each(|dep| {
+            if let Some(group) = &dep.group_id {
+                if let Some(sg) = &self.skip_group {
+                    if !group.starts_with(sg) {
+                        dep.latest_version = Some(get_latest_version(dep));
+                        if dep.version != dep.latest_version {
+                            println!("\t{:?}", &dep);
+                        }
+                    }
+                }
+            }
+        });
+
+        self.modules.iter_mut().for_each(|module| {
+            println!("{:?}", module.artifact.artifact_id);
+            module.dependencies.iter_mut().for_each(|dep| {
+                if let Some(group) = &dep.group_id {
+                    if let Some(sg) = &self.skip_group {
+                        if !group.starts_with(sg) {
+                            dep.latest_version = Some(get_latest_version(dep));
+                            if dep.version != dep.latest_version {
+                                println!("\t{:?}", &dep);
+                            }
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    pub fn fill_missing_properties(&mut self, parents: &[Pom]) -> &mut Self {
+        let mut zxc = vec![];
+        parents.iter().for_each(|p| zxc.push(p));
+
+        self.dependencies.iter_mut().for_each(|dep| {
+            dep.version = {
+                match &dep.version {
+                    Some(v) => {
+                        if v.starts_with("$") {
+                            get_version_from_parents(dep, &zxc)
+                        } else {
+                            Some(v.to_string())
+                        }
+                    }
+                    None => {
+                        let art_id = format!("${{{}.version}}", &dep.artifact_id);
+                        dep.version = Some(art_id);
+                        get_version_from_parents(dep, &zxc)
+                    }
+                }
+            }
+        });
+
+        let mut p2 = vec![];
+        parents.iter().for_each(|p| p2.push(p));
+        let binding = self.clone();
+        p2.push(&binding);
+        self.modules.iter_mut().for_each(|module| {
+            module.dependencies.iter_mut().for_each(|dep| {
+                dep.version = {
+                    match &dep.version {
+                        Some(v) => {
+                            if v.starts_with("$") {
+                                get_version_from_parents(dep, &p2)
+                            } else {
+                                Some(v.to_string())
+                            }
+                        }
+                        None => {
+                            let art_id = format!("${{{}.version}}", &dep.artifact_id);
+                            dep.version = Some(art_id);
+                            get_version_from_parents(dep, &p2)
+                        }
+                    }
+                }
+            })
+        });
+
+        self
+    }
 }
 
 impl Module {
@@ -203,7 +320,7 @@ impl Module {
             .replace("\t", "")
             .replace(" ", "");
         let artifact_pattern = Regex::new(r"<artifactId>(.*)</artifactId>").unwrap();
-        let pom = remove_parent(&pom);
+        let pom = remove_parent(pom);
         let artifact_id = artifact_pattern
             .captures(&pom)
             .unwrap()
@@ -222,31 +339,24 @@ fn get_artifact(input: &str) -> Artifact {
     let group_pattern = Regex::new(r"<groupId>(.*)</groupId>").unwrap();
     let artifact_pattern = Regex::new(r"<artifactId>(.*)</artifactId>").unwrap();
     let version_pattern = Regex::new(r"<version>(.*)</version>").unwrap();
-    //todo!();
+
     let artifact_id = artifact_pattern
         .captures(input)
         .unwrap()
         .get(1)
         .map_or("", |v| v.as_str());
-    //let group_id = group_pattern
-    //    .captures(input)
-    //    .unwrap()
-    //    .get(1)
-    //    .map_or("", |v| v.as_str());
 
-    let group_id = if let Some(v) = group_pattern.captures(input) {
-        Some(v.get(1).map_or("", |v| v.as_str()).to_string())
-    } else {
-        None
-    };
+    let group_id = group_pattern
+        .captures(input)
+        .map(|v| v.get(1).map_or("", |v| v.as_str()).to_string());
 
     Artifact {
         group_id,
         artifact_id: String::from(artifact_id),
-        version: match version_pattern.captures(input) {
-            Some(v) => Some(v.get(1).map_or("", |v| v.as_str()).to_string()),
-            None => None, //format!("${{{}.version}}", artifact_id),
-        },
+        version: version_pattern
+            .captures(input)
+            .map(|v| v.get(1).map_or("", |v| v.as_str()).to_string()),
+        latest_version: None,
     }
 }
 
@@ -254,32 +364,54 @@ fn get_dependencies(pom: &str) -> Vec<Artifact> {
     let dependency_pattern = Regex::new(r"<dependency>([\s\S]*?)<\/dependency>").unwrap();
     let mut dependencies = vec![];
 
-    dependency_pattern.captures_iter(&pom).for_each(|f| {
-        let artifact = get_artifact(f.get(0).map_or("", |v| v.as_str()));
+    dependency_pattern.captures_iter(pom).for_each(|f| {
+        let mut artifact = get_artifact(f.get(0).map_or("", |v| v.as_str()));
+        if let Some(ref v) = artifact.version {
+            if v.starts_with("$") {
+                artifact.version = get_property(v, pom);
+            }
+        }
         dependencies.push(artifact);
     });
     dependencies
+}
+
+fn get_property(prop: &str, pom: &str) -> Option<String> {
+    let properties_pattern = Regex::new(r"<properties>([\s\S]*?)<\/properties>").unwrap();
+    let properties = match properties_pattern.captures(pom) {
+        Some(props) => props.get(0).map_or("", |v| v.as_str()),
+        None => "",
+    };
+
+    let version_tag = prop.replace("${", "").replace("}", "");
+    let property_pattern_str = format!(r"<{}>(.*)</{}>", version_tag, version_tag);
+    let property_pattern = Regex::new(&property_pattern_str).unwrap();
+
+    match property_pattern.captures(properties) {
+        Some(res) => res.get(1).map(|v| v.as_str().to_string()),
+        None => Some(String::from(prop)),
+    }
 }
 
 fn remove_parent(pom: &str) -> String {
     let parent_pattern = Regex::new(r"<parent>([\s\S]*?)<\/parent>").unwrap();
     let result = parent_pattern.replace(pom, "");
 
-    result.to_owned().to_string()
+    result.clone().to_string()
 }
 
 fn remove_build(pom: &str) -> String {
     let parent_pattern = Regex::new(r"<build>([\s\S]*?)<\/build>").unwrap();
     let result = parent_pattern.replace(pom, "");
 
-    result.to_owned().to_string()
+    result.clone().to_string()
 }
 
 fn remove_plugins(pom: &str) -> String {
     let parent_pattern = Regex::new(r"<plugins>([\s\S]*?)<\/plugins>").unwrap();
     let result = parent_pattern.replace(pom, "");
 
-    result.to_owned().to_string()
+    result.clone().to_string()
 }
 
 fn fetch_parent_pom(parent_artifact: Option<Artifact>) -> Option<String> {
@@ -314,6 +446,24 @@ fn fetch_from_maven_central(url: &str) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+fn get_latest_version(art: &Artifact) -> String {
+    let mut input = Command::new("sh");
+
+    input
+        .arg("mvn_latest_version.sh")
+        .arg("-g")
+        .arg(match &art.group_id {
+            Some(g) => g,
+            None => "",
+        })
+        .arg("-a")
+        .arg(&art.artifact_id);
+    let output = input.output().expect("Error!");
+    let mut version = String::from_utf8(output.stdout).unwrap();
+    version.retain(|c| !c.is_whitespace());
+    version
+}
+
 impl fmt::Debug for Pom {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -328,8 +478,8 @@ impl fmt::Debug for Artifact {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{{\"groupId\": {:#?},\"artifactId\": {:#?}, \"version\": {:#?}}}",
-            self.group_id, self.artifact_id, self.version
+            "{{\"groupId\": {:#?},\"artifactId\": {:#?}, \"version\": {:#?}, \"latestVersion\": {:#?}}}",
+            self.group_id.clone().unwrap_or_default(), self.artifact_id, self.version.clone().unwrap_or_default(), self.latest_version.clone().unwrap_or_default()
         )
     }
 }
